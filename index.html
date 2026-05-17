@@ -28,7 +28,15 @@
 <body>
 
 <div id="map"></div>
-<div id="ui">🚗 Tokyo City Drive — ドラッグで移動 · スクロールでズーム · 右ドラッグで視点調整</div>
+<div id="ui">
+  🚗 Tokyo City Drive — ドラッグで移動 · スクロールでズーム · 右ドラッグで視点調整
+  <span style="pointer-events:auto; margin-left:18px; white-space:nowrap;">
+    交通量
+    <input type="range" id="traffic" min="0" max="200" value="120"
+           style="vertical-align:middle; width:90px; margin:0 6px; cursor:pointer;">
+    <span id="trafficVal">120</span> 台
+  </span>
+</div>
 
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 
@@ -155,72 +163,125 @@ function setupCarLayer() {
   const scene  = new THREE.Scene();
   const camera = new THREE.Camera();
 
-  // 照明
   scene.add(new THREE.AmbientLight(0xffffff, 0.75));
   const sun = new THREE.DirectionalLight(0xffffff, 0.85);
   sun.position.set(100, 200, 50);
   scene.add(sun);
 
-  // ─── 車の配置 ──────────────────────────────────────
+  // ─── 座標変換 ──────────────────────────────────────
   // ローカル座標系：東京駅を原点とするメートル単位
-  //   +x = 東、−x = 西
-  //   +z = 南、−z = 北  （Three.js → メルカトル変換により）
+  //   +x = 東、−x = 西、+z = 南、−z = 北
 
-  const ROAD_SPACING = 80;  // m：道路間隔
-  const ROAD_EXTENT  = 350; // m：道路の半長
-  const LANE         = 4;   // m：車線オフセット
-  const BASE_SPEED   = 10;  // m/s
+  function lngLatToLocal(lng, lat) {
+    const mc = maplibregl.MercatorCoordinate.fromLngLat([lng, lat], 0);
+    return {
+      x: (mc.x - originMercator.x) / SCALE,
+      z: (mc.y - originMercator.y) / SCALE
+    };
+  }
 
-  // 決定論的乱数（リロードしても同じ配置）
-  let _rs = 0xbeef1234;
+  function buildPath(coords) {
+    const pts = coords.map(([lng, lat]) => lngLatToLocal(lng, lat));
+    let cum = 0;
+    const segs = [];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const dx = pts[i+1].x - pts[i].x, dz = pts[i+1].z - pts[i].z;
+      const len = Math.hypot(dx, dz);
+      segs.push({ p0: pts[i], p1: pts[i+1], len, cum });
+      cum += len;
+    }
+    return { segs, total: cum };
+  }
+
+  function pathAt(path, t) {
+    const dist = ((t % path.total) + path.total) % path.total;
+    let s = path.segs[0];
+    for (const seg of path.segs) {
+      if (seg.cum <= dist) s = seg; else break;
+    }
+    const u = s.len > 0 ? Math.min((dist - s.cum) / s.len, 1) : 0;
+    return {
+      x:  s.p0.x + (s.p1.x - s.p0.x) * u,
+      z:  s.p0.z + (s.p1.z - s.p0.z) * u,
+      tx: s.len > 0 ? (s.p1.x - s.p0.x) / s.len : 1,
+      tz: s.len > 0 ? (s.p1.z - s.p0.z) / s.len : 0
+    };
+  }
+
+  // 決定論的乱数（リセット可能）
+  const SEED = 0xbeef1234;
+  let _rs = SEED;
   function rnd() {
     _rs ^= _rs << 13; _rs ^= _rs >> 17; _rs ^= _rs << 5;
     return (_rs >>> 0) / 0x100000000;
   }
+  function resetRnd() { _rs = SEED; }
+
+  const CAR_SPEED = 8;
+  const LANE_OFF  = 2.5;
+  let maxCars = 120;
 
   const carData = [];
   let colorIdx = 0;
+  let roadPaths = null; // 一度構築したら使いまわす
 
-  function spawnCar(roadX, roadZ, dx, dz, laneOffX, laneOffZ) {
-    const mesh  = makeCar(CAR_COLORS[colorIdx++ % CAR_COLORS.length]);
-    const speed = BASE_SPEED + rnd() * 8;
-    const along = (rnd() - 0.5) * ROAD_EXTENT * 2;
-
-    mesh.position.set(
-      roadX + laneOffX + (dx !== 0 ? along : 0),
-      0,
-      roadZ + laneOffZ + (dz !== 0 ? along : 0)
-    );
-
-    // 向き
-    if      (dx > 0) mesh.rotation.y = 0;            // 東
-    else if (dx < 0) mesh.rotation.y = Math.PI;       // 西
-    else if (dz < 0) mesh.rotation.y = -Math.PI / 2; // 北
-    else             mesh.rotation.y =  Math.PI / 2;  // 南
-
-    scene.add(mesh);
-    carData.push({
-      mesh,
-      vx: dx * speed,
-      vz: dz * speed,
-      laneX: roadX + laneOffX,
-      laneZ: roadZ + laneOffZ,
-      isNS: dx === 0
+  // ─── タイルから道路経路を構築 ─────────────────────────
+  function buildRoadPaths() {
+    const features = map.querySourceFeatures('openmaptiles', {
+      sourceLayer: 'transportation',
+      filter: ['in', 'class',
+        'motorway', 'trunk', 'primary', 'secondary',
+        'tertiary', 'residential', 'service'
+      ]
     });
+    const seen = new Set();
+    const paths = [];
+    for (const f of features) {
+      if (f.geometry.type !== 'LineString') continue;
+      const key = f.id != null ? String(f.id)
+                               : f.geometry.coordinates.map(c => c.join(',')).join('|');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const path = buildPath(f.geometry.coordinates);
+      if (path.total < 15) continue;
+      paths.push(path);
+    }
+    resetRnd();
+    paths.sort(() => rnd() - 0.5);
+    return paths;
   }
 
-  const N = 7; // 各軸に 7本の道路
-  for (let i = 0; i < N; i++) {
-    const off = (i - (N - 1) / 2) * ROAD_SPACING;
+  // ─── 車の配置（交通量変更時も呼ぶ） ─────────────────────
+  function spawnCarsOnRoads() {
+    for (const c of carData) scene.remove(c.mesh);
+    carData.length = 0;
+    colorIdx = 0;
 
-    // 南北方向の道路（x = off）
-    spawnCar(off, 0, 0, -1,  LANE, 0); // 北向き
-    spawnCar(off, 0, 0,  1, -LANE, 0); // 南向き
+    if (!roadPaths) roadPaths = buildRoadPaths();
 
-    // 東西方向の道路（z = off）
-    spawnCar(0, off,  1, 0, 0,  LANE); // 東向き
-    spawnCar(0, off, -1, 0, 0, -LANE); // 西向き
+    resetRnd();
+    for (const path of roadPaths) {
+      if (carData.length >= maxCars) break;
+      const perDir = Math.max(1, Math.min(3, Math.floor(path.total / 80)));
+      for (const dir of [1, -1]) {
+        for (let i = 0; i < perDir && carData.length < maxCars; i++) {
+          const mesh  = makeCar(CAR_COLORS[colorIdx++ % CAR_COLORS.length]);
+          const speed = (CAR_SPEED + rnd() * 6) * dir;
+          scene.add(mesh);
+          carData.push({ mesh, path, t: rnd() * path.total, speed });
+        }
+      }
+    }
   }
+
+  // ─── 交通量スライダー ─────────────────────────────────
+  const sliderEl = document.getElementById('traffic');
+  const valEl    = document.getElementById('trafficVal');
+  sliderEl.addEventListener('input', () => {
+    maxCars = parseInt(sliderEl.value);
+    valEl.textContent = maxCars;
+    spawnCarsOnRoads();
+  });
 
   // ─── WebGL レンダラー（MapLibre のキャンバスを共有）──
   let renderer;
@@ -240,13 +301,10 @@ function setupCarLayer() {
     },
 
     render(gl, args) {
-      // MapLibre v2（配列）と v3/v4（オブジェクト）の両方に対応
       const rawMatrix = (args instanceof Float32Array || Array.isArray(args))
-        ? args
-        : args?.defaultProjectionData?.mainMatrix;
+        ? args : args?.defaultProjectionData?.mainMatrix;
       if (!rawMatrix) return;
 
-      // ローカル座標 → メルカトル座標 への変換行列
       const rotX = new THREE.Matrix4().makeRotationAxis(
         new THREE.Vector3(1, 0, 0), Math.PI / 2
       );
@@ -264,27 +322,29 @@ function setupCarLayer() {
   };
 
   map.addLayer(customLayer);
+  map.once('idle', spawnCarsOnRoads);
 
   // ─── アニメーションループ ────────────────────────────
   const clock = new THREE.Clock();
-  const WRAP  = ROAD_EXTENT + 20;
 
   (function animate() {
     requestAnimationFrame(animate);
     const dt = Math.min(clock.getDelta(), 0.1);
 
     for (const c of carData) {
-      if (c.isNS) {
-        c.mesh.position.x  = c.laneX;      // 車線固定
-        c.mesh.position.z += c.vz * dt;
-        if (c.mesh.position.z >  WRAP) c.mesh.position.z = -WRAP;
-        if (c.mesh.position.z < -WRAP) c.mesh.position.z =  WRAP;
-      } else {
-        c.mesh.position.z  = c.laneZ;      // 車線固定
-        c.mesh.position.x += c.vx * dt;
-        if (c.mesh.position.x >  WRAP) c.mesh.position.x = -WRAP;
-        if (c.mesh.position.x < -WRAP) c.mesh.position.x =  WRAP;
-      }
+      c.t += c.speed * dt;
+      const { x, z, tx, tz } = pathAt(c.path, c.t);
+      const dir = c.speed > 0 ? 1 : -1;
+
+      // 車線オフセット：接線 (tx,tz) の左垂線 (-tz, tx) 方向
+      c.mesh.position.set(
+        x - tz * dir * LANE_OFF,
+        0,
+        z + tx * dir * LANE_OFF
+      );
+      // rotation.y = θ で +X軸が (cosθ, 0, -sinθ) を向く
+      // 方向 (tx, tz) を向かせるには θ = atan2(-tz, tx)
+      c.mesh.rotation.y = Math.atan2(-tz * dir, tx * dir);
     }
   })();
 }
