@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tokyo City Drive</title>
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; }
+    body { overflow: hidden; }
+    #map { width: 100vw; height: 100vh; }
+    #ui {
+      position: fixed;
+      top: 14px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,.58);
+      backdrop-filter: blur(6px);
+      color: #fff;
+      font: 14px/1.5 'Segoe UI', sans-serif;
+      padding: 7px 20px;
+      border-radius: 24px;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+
+<div id="map"></div>
+<div id="ui">🚗 Tokyo City Drive — ドラッグで移動 · スクロールでズーム · 右ドラッグで視点調整</div>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ─── 場所：東京駅周辺 ────────────────────────────────
+const CENTER_LNG = 139.7671;
+const CENTER_LAT = 35.6812;
+
+const map = new maplibregl.Map({
+  container: 'map',
+  style: 'https://tiles.openfreemap.org/styles/liberty',
+  center: [CENTER_LNG, CENTER_LAT],
+  zoom: 16.5,
+  pitch: 55,
+  bearing: -17,
+  antialias: true
+});
+
+map.on('load', () => {
+  // ラベル（テキスト）レイヤーの手前に建物を挿入
+  let firstLabelId;
+  for (const layer of map.getStyle().layers) {
+    if (layer.type === 'symbol' && layer.layout?.['text-field']) {
+      firstLabelId = layer.id;
+      break;
+    }
+  }
+
+  // 3D 建物 (OpenMapTiles スキーマ)
+  map.addLayer({
+    id: '3d-buildings',
+    source: 'openmaptiles',
+    'source-layer': 'building',
+    type: 'fill-extrusion',
+    minzoom: 14,
+    paint: {
+      'fill-extrusion-color': [
+        'interpolate', ['linear'],
+        ['coalesce', ['get', 'render_height'], 8],
+          0,  '#d4c9b0',
+         30,  '#b0a898',
+        100,  '#888880',
+        250,  '#66645e'
+      ],
+      'fill-extrusion-height': ['coalesce', ['get', 'render_height'], 8],
+      'fill-extrusion-base':   ['coalesce', ['get', 'render_min_height'], 0],
+      'fill-extrusion-opacity': 0.88
+    }
+  }, firstLabelId);
+
+  setupCarLayer();
+});
+
+// ─── Three.js 車レイヤー ──────────────────────────────
+
+// マップ原点（東京駅）のメルカトル座標
+const originMercator = maplibregl.MercatorCoordinate.fromLngLat(
+  [CENTER_LNG, CENTER_LAT], 0
+);
+// 1メートル → メルカトル単位の変換係数
+const SCALE = originMercator.meterInMercatorCoordinateUnits();
+
+const CAR_COLORS = [
+  0xdd2222, 0x2244cc, 0x22aa33, 0xdd9900,
+  0xcc22cc, 0x11aacc, 0xddcc00, 0xff6600,
+  0xaa2255, 0x226699, 0x66aa22, 0xdd4400,
+];
+
+function makeCar(color) {
+  const g     = new THREE.Group();
+  const body  = new THREE.MeshLambertMaterial({ color });
+  const dark  = new THREE.MeshLambertMaterial({ color: 0x111111 });
+  const glass = new THREE.MeshLambertMaterial({ color: 0x88aacc, transparent: true, opacity: 0.6 });
+  const lamp  = new THREE.MeshBasicMaterial({ color: 0xffffaa });
+
+  // ボディ
+  const bodyM = new THREE.Mesh(new THREE.BoxGeometry(4, 1.1, 2), body);
+  bodyM.position.y = 0.85;
+  g.add(bodyM);
+
+  // キャビン
+  const cabin = new THREE.Mesh(new THREE.BoxGeometry(2.1, 1.0, 1.72), body);
+  cabin.position.set(-0.35, 1.85, 0);
+  g.add(cabin);
+
+  // ガラス
+  const win = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.72, 1.73), glass);
+  win.position.set(-0.35, 1.85, 0);
+  g.add(win);
+
+  // ヘッドライト
+  for (const z of [0.68, -0.68]) {
+    const hl = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.28, 0.22), lamp);
+    hl.position.set(2.05, 0.85, z);
+    g.add(hl);
+  }
+
+  // ホイール
+  const wg = new THREE.CylinderGeometry(0.4, 0.4, 0.3, 10);
+  for (const [wx, wy, wz] of [
+    [1.3, 0.4, 0.9], [1.3, 0.4, -0.9],
+    [-1.3, 0.4, 0.9], [-1.3, 0.4, -0.9]
+  ]) {
+    const w = new THREE.Mesh(wg, dark);
+    w.rotation.z = Math.PI / 2;
+    w.position.set(wx, wy, wz);
+    g.add(w);
+  }
+
+  return g;
+}
+
+function setupCarLayer() {
+  const scene  = new THREE.Scene();
+  const camera = new THREE.Camera();
+
+  // 照明
+  scene.add(new THREE.AmbientLight(0xffffff, 0.75));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.85);
+  sun.position.set(100, 200, 50);
+  scene.add(sun);
+
+  // ─── 車の配置 ──────────────────────────────────────
+  // ローカル座標系：東京駅を原点とするメートル単位
+  //   +x = 東、−x = 西
+  //   +z = 南、−z = 北  （Three.js → メルカトル変換により）
+
+  const ROAD_SPACING = 80;  // m：道路間隔
+  const ROAD_EXTENT  = 350; // m：道路の半長
+  const LANE         = 4;   // m：車線オフセット
+  const BASE_SPEED   = 10;  // m/s
+
+  // 決定論的乱数（リロードしても同じ配置）
+  let _rs = 0xbeef1234;
+  function rnd() {
+    _rs ^= _rs << 13; _rs ^= _rs >> 17; _rs ^= _rs << 5;
+    return (_rs >>> 0) / 0x100000000;
+  }
+
+  const carData = [];
+  let colorIdx = 0;
+
+  function spawnCar(roadX, roadZ, dx, dz, laneOffX, laneOffZ) {
+    const mesh  = makeCar(CAR_COLORS[colorIdx++ % CAR_COLORS.length]);
+    const speed = BASE_SPEED + rnd() * 8;
+    const along = (rnd() - 0.5) * ROAD_EXTENT * 2;
+
+    mesh.position.set(
+      roadX + laneOffX + (dx !== 0 ? along : 0),
+      0,
+      roadZ + laneOffZ + (dz !== 0 ? along : 0)
+    );
+
+    // 向き
+    if      (dx > 0) mesh.rotation.y = 0;            // 東
+    else if (dx < 0) mesh.rotation.y = Math.PI;       // 西
+    else if (dz < 0) mesh.rotation.y = -Math.PI / 2; // 北
+    else             mesh.rotation.y =  Math.PI / 2;  // 南
+
+    scene.add(mesh);
+    carData.push({
+      mesh,
+      vx: dx * speed,
+      vz: dz * speed,
+      laneX: roadX + laneOffX,
+      laneZ: roadZ + laneOffZ,
+      isNS: dx === 0
+    });
+  }
+
+  const N = 7; // 各軸に 7本の道路
+  for (let i = 0; i < N; i++) {
+    const off = (i - (N - 1) / 2) * ROAD_SPACING;
+
+    // 南北方向の道路（x = off）
+    spawnCar(off, 0, 0, -1,  LANE, 0); // 北向き
+    spawnCar(off, 0, 0,  1, -LANE, 0); // 南向き
+
+    // 東西方向の道路（z = off）
+    spawnCar(0, off,  1, 0, 0,  LANE); // 東向き
+    spawnCar(0, off, -1, 0, 0, -LANE); // 西向き
+  }
+
+  // ─── WebGL レンダラー（MapLibre のキャンバスを共有）──
+  let renderer;
+
+  const customLayer = {
+    id: '3d-cars',
+    type: 'custom',
+    renderingMode: '3d',
+
+    onAdd(map, gl) {
+      renderer = new THREE.WebGLRenderer({
+        canvas: map.getCanvas(),
+        context: gl,
+        antialias: true
+      });
+      renderer.autoClear = false;
+    },
+
+    render(gl, args) {
+      // MapLibre v2（配列）と v3/v4（オブジェクト）の両方に対応
+      const rawMatrix = (args instanceof Float32Array || Array.isArray(args))
+        ? args
+        : args?.defaultProjectionData?.mainMatrix;
+      if (!rawMatrix) return;
+
+      // ローカル座標 → メルカトル座標 への変換行列
+      const rotX = new THREE.Matrix4().makeRotationAxis(
+        new THREE.Vector3(1, 0, 0), Math.PI / 2
+      );
+      const m = new THREE.Matrix4().fromArray(rawMatrix);
+      const l = new THREE.Matrix4()
+        .makeTranslation(originMercator.x, originMercator.y, originMercator.z)
+        .scale(new THREE.Vector3(SCALE, -SCALE, SCALE))
+        .multiply(rotX);
+
+      camera.projectionMatrix = m.multiply(l);
+      renderer.resetState();
+      renderer.render(scene, camera);
+      map.triggerRepaint();
+    }
+  };
+
+  map.addLayer(customLayer);
+
+  // ─── アニメーションループ ────────────────────────────
+  const clock = new THREE.Clock();
+  const WRAP  = ROAD_EXTENT + 20;
+
+  (function animate() {
+    requestAnimationFrame(animate);
+    const dt = Math.min(clock.getDelta(), 0.1);
+
+    for (const c of carData) {
+      if (c.isNS) {
+        c.mesh.position.x  = c.laneX;      // 車線固定
+        c.mesh.position.z += c.vz * dt;
+        if (c.mesh.position.z >  WRAP) c.mesh.position.z = -WRAP;
+        if (c.mesh.position.z < -WRAP) c.mesh.position.z =  WRAP;
+      } else {
+        c.mesh.position.z  = c.laneZ;      // 車線固定
+        c.mesh.position.x += c.vx * dt;
+        if (c.mesh.position.x >  WRAP) c.mesh.position.x = -WRAP;
+        if (c.mesh.position.x < -WRAP) c.mesh.position.x =  WRAP;
+      }
+    }
+  })();
+}
+</script>
+</body>
+</html>
