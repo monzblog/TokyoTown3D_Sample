@@ -23,18 +23,57 @@
       pointer-events: none;
       white-space: nowrap;
     }
+    #cities {
+      position: fixed;
+      top: 50%;
+      left: 14px;
+      transform: translateY(-50%);
+      background: rgba(0,0,0,.58);
+      backdrop-filter: blur(6px);
+      color: #fff;
+      font: 13px/1.5 'Segoe UI', sans-serif;
+      padding: 8px 6px;
+      border-radius: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      max-height: 90vh;
+      overflow-y: auto;
+    }
+    #cities .sec {
+      font-size: 10px;
+      color: #aaa;
+      text-align: center;
+      margin: 5px 2px 2px;
+      letter-spacing: 0.5px;
+      pointer-events: none;
+    }
+    #cities button {
+      background: rgba(255,255,255,0.1);
+      border: none;
+      color: #fff;
+      padding: 4px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      font: inherit;
+      white-space: nowrap;
+      transition: background 0.15s;
+    }
+    #cities button:hover  { background: rgba(255,255,255,0.25); }
+    #cities button.active { background: rgba(100,160,255,0.45); }
   </style>
 </head>
 <body>
 
 <div id="map"></div>
+<div id="cities"></div>
 <div id="ui">
   🚗 Tokyo City Drive — ドラッグで移動 · スクロールでズーム · 右ドラッグで視点調整
   <span style="pointer-events:auto; margin-left:18px; white-space:nowrap;">
     交通量
-    <input type="range" id="traffic" min="0" max="200" value="120"
+    <input type="range" id="traffic" min="0" max="3000" value="800"
            style="vertical-align:middle; width:90px; margin:0 6px; cursor:pointer;">
-    <span id="trafficVal">120</span> 台
+    <span id="trafficVal">800</span> 台
   </span>
 </div>
 
@@ -217,9 +256,9 @@ function setupCarLayer() {
   }
   function resetRnd() { _rs = SEED; }
 
-  const CAR_SPEED = 8;
+  const CAR_SPEED = 5;
   const LANE_OFF  = 2.5;
-  let maxCars = 120;
+  let maxCars = 800;
 
   const carData = [];
   let colorIdx = 0;
@@ -243,7 +282,7 @@ function setupCarLayer() {
       if (seen.has(key)) continue;
       seen.add(key);
       const path = buildPath(f.geometry.coordinates);
-      if (path.total < 15) continue;
+      if (path.total < 30) continue;
       paths.push(path);
     }
     resetRnd();
@@ -266,9 +305,9 @@ function setupCarLayer() {
       for (const dir of [1, -1]) {
         for (let i = 0; i < perDir && carData.length < maxCars; i++) {
           const mesh  = makeCar(CAR_COLORS[colorIdx++ % CAR_COLORS.length]);
-          const speed = (CAR_SPEED + rnd() * 6) * dir;
+          const speed = (CAR_SPEED + rnd() * 3) * dir;
           scene.add(mesh);
-          carData.push({ mesh, path, t: rnd() * path.total, speed });
+          carData.push({ mesh, path, t: rnd() * path.total, speed, fading: 0, opacity: 1 });
         }
       }
     }
@@ -324,26 +363,120 @@ function setupCarLayer() {
   map.addLayer(customLayer);
   map.once('idle', spawnCarsOnRoads);
 
+  // マップ移動後にタイルが読み込まれたら道路を再取得して再スポーン
+  let moveTimer = null;
+  map.on('moveend', () => {
+    clearTimeout(moveTimer);
+    moveTimer = setTimeout(() => {
+      map.once('idle', () => {
+        roadPaths = null;
+        spawnCarsOnRoads();
+      });
+    }, 300);
+  });
+
+  // ─── 都市ボタン ───────────────────────────────────────
+  const CITIES = [
+    { sec: '🗾 日本' },
+    { name: '東京',   lng: 139.7671, lat: 35.6812 },
+    { name: '横浜',   lng: 139.6380, lat: 35.4437 },
+    { name: '大阪',   lng: 135.5023, lat: 34.6937 },
+    { name: '京都',   lng: 135.7681, lat: 35.0116 },
+    { name: '神戸',   lng: 135.1955, lat: 34.6901 },
+    { name: '名古屋', lng: 136.9066, lat: 35.1815 },
+    { name: '広島',   lng: 132.4553, lat: 34.3853 },
+    { name: '福岡',   lng: 130.4017, lat: 33.5902 },
+    { name: '仙台',   lng: 140.8694, lat: 38.2688 },
+    { name: '札幌',   lng: 141.3544, lat: 43.0621 },
+    { sec: '🌍 世界' },
+    { name: 'New York',  lng:  -74.0060, lat:  40.7128 },
+    { name: 'London',    lng:   -0.1276, lat:  51.5074 },
+    { name: 'Paris',     lng:    2.3522, lat:  48.8566 },
+    { name: 'Dubai',     lng:   55.2708, lat:  25.2048 },
+    { name: 'Singapore', lng:  103.8198, lat:   1.3521 },
+    { name: 'Sydney',    lng:  151.2093, lat: -33.8688 },
+  ];
+
+  const cityPanel = document.getElementById('cities');
+  let activeBtn = null;
+
+  for (const c of CITIES) {
+    if (c.sec) {
+      const d = document.createElement('div');
+      d.className = 'sec';
+      d.textContent = c.sec;
+      cityPanel.appendChild(d);
+    } else {
+      const btn = document.createElement('button');
+      btn.textContent = c.name;
+      btn.addEventListener('click', () => {
+        if (activeBtn) activeBtn.classList.remove('active');
+        btn.classList.add('active');
+        activeBtn = btn;
+        map.flyTo({ center: [c.lng, c.lat], zoom: 16.5, pitch: 55, bearing: -17, duration: 2000 });
+      });
+      cityPanel.appendChild(btn);
+      if (c.name === '東京') { btn.classList.add('active'); activeBtn = btn; }
+    }
+  }
+
   // ─── アニメーションループ ────────────────────────────
   const clock = new THREE.Clock();
+  const FADE_DUR = 0.4;
+
+  function setOpacity(group, opacity) {
+    group.traverse(obj => {
+      if (obj.isMesh) {
+        obj.material.transparent = opacity < 1;
+        obj.material.opacity = opacity;
+      }
+    });
+  }
 
   (function animate() {
     requestAnimationFrame(animate);
     const dt = Math.min(clock.getDelta(), 0.1);
 
     for (const c of carData) {
+      // フェードアウト中：透明になったら別経路へ移動してフェードイン開始
+      if (c.fading === 1) {
+        c.opacity = Math.max(0, c.opacity - dt / FADE_DUR);
+        setOpacity(c.mesh, c.opacity);
+        if (c.opacity <= 0) {
+          const idx = Math.floor(Math.random() * roadPaths.length);
+          c.path = roadPaths[idx];
+          c.t    = c.speed > 0 ? 0 : c.path.total;
+          c.fading = 2;
+        }
+        continue;
+      }
+
+      // フェードイン中
+      if (c.fading === 2) {
+        c.opacity = Math.min(1, c.opacity + dt / FADE_DUR);
+        setOpacity(c.mesh, c.opacity);
+        if (c.opacity >= 1) c.fading = 0;
+      }
+
+      // 移動
       c.t += c.speed * dt;
+
+      // 経路の終端に達したらフェードアウト開始
+      const done = c.speed > 0 ? c.t >= c.path.total : c.t < 0;
+      if (done && c.fading === 0 && roadPaths.length > 0) {
+        c.t = c.speed > 0 ? c.path.total : 0;
+        c.fading = 1;
+        c.opacity = 1;
+      }
+
       const { x, z, tx, tz } = pathAt(c.path, c.t);
       const dir = c.speed > 0 ? 1 : -1;
 
-      // 車線オフセット：接線 (tx,tz) の左垂線 (-tz, tx) 方向
       c.mesh.position.set(
         x - tz * dir * LANE_OFF,
         0,
         z + tx * dir * LANE_OFF
       );
-      // rotation.y = θ で +X軸が (cosθ, 0, -sinθ) を向く
-      // 方向 (tx, tz) を向かせるには θ = atan2(-tz, tx)
       c.mesh.rotation.y = Math.atan2(-tz * dir, tx * dir);
     }
   })();
